@@ -371,9 +371,17 @@ function computeRows(race, entities, local, marketW, excludeId) {
     }
 
     let score = 0;
-    score += 3.2 * (jP - 0.12);
+    // Weight scaled to backtest-proven edge, not raw magnitude: jockey cleared only
+    // 56.2% above-average-on-winner (marginal) vs trainer's 60.2% (real) — jockey was
+    // previously weighted HIGHER than trainer (3.2 vs 3.0), which let jockey identity
+    // (especially high-mount-volume riders) dominate the score more than the evidence
+    // supports. Rescaled proportionally to the edge each factor actually showed.
+    score += 1.8 * (jP - 0.12);
     score += 3.0 * (tP - 0.14);
-    score += 1.0 * (oP - 0.13);
+    // Owner factor computed for diagnostic/audit display only (see Performance tab).
+    // NOT scored: backtest showed 46.7% above-average-on-winner — worse than a coin
+    // flip, i.e. noise, not signal. Re-enable only if a larger sample proves otherwise.
+    // score += 1.0 * (oP - 0.13);
     if (form != null) score += 2.4 * (form - 0.33);
     if (surf != null) score += 1.8 * (surf - 0.12);
     if (dist != null) score += 1.4 * (dist - 0.12);
@@ -422,7 +430,7 @@ function analyzeRace(race, entities, local, marketW) {
   // most on mobile, where every scratch/ML edit re-runs this.
   const N = rows.length, SIMS = 6000;
   const pos = rows.map(() => new Array(N).fill(0));
-  const exacta = {}, trifecta = {};
+  const exacta = {}, trifecta = {}, superfecta = {};
   const s = rows.map((r) => Math.max(r.win, 1e-6));
   const keys = new Float64Array(N);
   for (let t = 0; t < SIMS; t++) {
@@ -432,7 +440,11 @@ function analyzeRace(race, entities, local, marketW) {
     for (let place = 0; place < N; place++) pos[order[place]][place]++;
     const ex = order[0] + ">" + order[1];
     exacta[ex] = (exacta[ex] || 0) + 1;
-    if (N >= 3) { const tr = ex + ">" + order[2]; trifecta[tr] = (trifecta[tr] || 0) + 1; }
+    if (N >= 3) {
+      const tr = ex + ">" + order[2];
+      trifecta[tr] = (trifecta[tr] || 0) + 1;
+      if (N >= 4) { const sf = tr + ">" + order[3]; superfecta[sf] = (superfecta[sf] || 0) + 1; }
+    }
   }
   rows.forEach((r, i) => {
     r.winS = pos[i][0] / SIMS;
@@ -442,7 +454,7 @@ function analyzeRace(race, entities, local, marketW) {
   const proj = rows.slice().sort((a, b) => b.win - a.win);
   const top = (m, n) => Object.entries(m).sort((a, b) => b[1] - a[1]).slice(0, n)
     .map(([k, c]) => ({ combo: k.split(">").map((i) => rows[+i].e), p: c / SIMS }));
-  return { rows, proj, exactas: top(exacta, 5), trifectas: top(trifecta, 5), off, bucket };
+  return { rows, proj, exactas: top(exacta, 5), trifectas: top(trifecta, 5), superfectas: N >= 4 ? top(superfecta, 5) : [], off, bucket };
 }
 
 /* ---- Model grading & self-calibration ---- */
@@ -482,7 +494,7 @@ function gradeAll(races, entities, local, marketW) {
   return out.sort((a, b) => (a.race.date < b.race.date ? 1 : -1));
 }
 
-const BLEND_CANDIDATES = [0.35, 0.5, 0.62, 0.75, 0.9];
+const BLEND_CANDIDATES = [0.35, 0.5, 0.62, 0.75, 0.85, 0.9, 0.95, 1.0];
 function calibrate(races, entities, local) {
   const graded = races.filter((r) => r.results?.length && (r.entries || []).filter((e) => !e.scratched).length >= 3);
   if (graded.length < 5) return { marketW: 0.62, n: graded.length, tuned: false };
@@ -515,7 +527,7 @@ function gradeBet(bet, races) {
   const sel = String(bet.selection || "").split(/[^0-9]+/).filter(Boolean).map(Number);
   if (!sel.length) return { status: "open" };
   const t = bet.type;
-  const need = t === "Win" ? 1 : t === "Place" ? 2 : t === "Show" ? 3 : t === "Exacta" ? 2 : t === "Trifecta" ? 3 : 0;
+  const need = t === "Win" ? 1 : t === "Place" ? 2 : t === "Show" ? 3 : t === "Exacta" ? 2 : t === "Trifecta" ? 3 : t === "Superfecta" ? 4 : 0;
   if (!need) return { status: "open" };
   if (t === "Win" || t === "Place" || t === "Show") {
     const topN = finPosts.slice(0, need);
@@ -1695,7 +1707,8 @@ function RaceView({ race, entities, local, onBack, onUpdate, onDelete, onEnrich,
       {/* Exotics */}
       {analysis && (
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(280px,1fr))", gap: 12, marginTop: 16 }}>
-          {[["Top exactas", analysis.exactas], ["Top trifectas", analysis.trifectas]].map(([label, list]) => (
+          {[["Top exactas", analysis.exactas], ["Top trifectas", analysis.trifectas], ["Top superfectas", analysis.superfectas || []]].map(([label, list]) => (
+            list.length > 0 && (
             <div key={label} className="card" style={{ padding: 14 }}>
               <div className="disp" style={{ fontWeight: 600, marginBottom: 8 }}>{label}</div>
               {list.map((c, i) => (
@@ -1705,6 +1718,7 @@ function RaceView({ race, entities, local, onBack, onUpdate, onDelete, onEnrich,
                 </div>
               ))}
             </div>
+            )
           ))}
         </div>
       )}
@@ -2000,7 +2014,7 @@ function Connections(props) {
 }
 
 /* ================= MY BETS ================= */
-const BET_TYPES = ["Win", "Place", "Show", "Exacta", "Trifecta", "Other"];
+const BET_TYPES = ["Win", "Place", "Show", "Exacta", "Trifecta", "Superfecta", "Other"];
 function BetsTab({ bets, persistBets, races }) {
   const today = localDate();
   const [f, setF] = useState({ date: today, raceId: "", type: "Win", selection: "", stake: "", collect: "", label: "" });
@@ -2058,7 +2072,7 @@ function BetsTab({ bets, persistBets, races }) {
           <select value={f.type} onChange={(e) => setF({ ...f, type: e.target.value })}>
             {BET_TYPES.map((t) => <option key={t}>{t}</option>)}
           </select>
-          <input placeholder={f.type === "Exacta" ? "e.g. 6-3" : f.type === "Trifecta" ? "e.g. 6-3-4" : "post #"} value={f.selection} onChange={(e) => setF({ ...f, selection: e.target.value })} style={{ width: 100 }} className="mono" />
+          <input placeholder={f.type === "Exacta" ? "e.g. 6-3" : f.type === "Trifecta" ? "e.g. 6-3-4" : f.type === "Superfecta" ? "e.g. 6-3-4-1" : "post #"} value={f.selection} onChange={(e) => setF({ ...f, selection: e.target.value })} style={{ width: 100 }} className="mono" />
           {!f.raceId && <input placeholder="Description" value={f.label} onChange={(e) => setF({ ...f, label: e.target.value })} style={{ width: 170 }} />}
           <input type="number" step="0.01" placeholder="Wager $" value={f.stake} onChange={(e) => setF({ ...f, stake: e.target.value })} style={{ width: 96 }} className="mono" />
           <input type="number" step="0.01" placeholder="Payout $" value={f.collect} onChange={(e) => setF({ ...f, collect: e.target.value })} style={{ width: 96 }} className="mono" title="Total you collect if it hits (from the ticket / will-pays). Editable later." />
