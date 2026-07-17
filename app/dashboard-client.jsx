@@ -1486,18 +1486,22 @@ function RaceView({ race, entities, local, onBack, onUpdate, onDelete, onEnrich,
     }
     if (!jobs.length) { setEnrichProg("Everything on this card is already enriched."); setTimeout(() => setEnrichProg(null), 2500); return; }
     const CONC = 2;
-    let done = 0, cursor = 0;
+    let done = 0, cursor = 0, failCount = 0, lastErr = null;
     setEnrichProg(`Researching ${jobs.length} names, ${Math.min(CONC, jobs.length)} at a time…`);
     const worker = async () => {
       while (cursor < jobs.length) {
         const job = jobs[cursor++];
-        try { await onEnrich(job[0], job[1]); } catch (e) { console.warn("enrich failed", job[1], e); }
+        try { await onEnrich(job[0], job[1]); }
+        catch (e) { failCount++; lastErr = e?.message || String(e); console.warn("enrich failed", job[1], e); }
         done++;
         setEnrichProg(`Researching card — ${done}/${jobs.length} done…`);
       }
     };
     await Promise.all(Array.from({ length: Math.min(CONC, jobs.length) }, worker));
     setEnrichProg(null);
+    if (failCount > 0) {
+      setErr(`Enrichment failed on ${failCount} of ${jobs.length} name${jobs.length > 1 ? "s" : ""}: ${lastErr}`);
+    }
   };
 
   const fetchResults = async () => {
