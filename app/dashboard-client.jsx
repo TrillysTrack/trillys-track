@@ -410,19 +410,34 @@ function computeRows(race, entities, local, marketW, excludeId) {
   }
 
   const MW = marketW == null ? 0.62 : marketW;
+  // Data-richness guard: the global calibrated weight assumes a "typical" mix of factors.
+  // A race running on jockey%/trainer% alone (form, figs, pace, surf/dist splits, connF —
+  // all null) has almost nothing real behind fP beyond two thin percentages, but softmax
+  // still stretches small differences between them into visible win% gaps. That let deep
+  // longshots (e.g. two 30/1 horses with unremarkable jockey/trainer stats) land within a
+  // point or two of legitimate 3/1-7/1 contenders, because the calibrated weight — tuned
+  // on races that DID have richer data — wasn't forced to defer to market here. Count how
+  // many of the richer factors are actually live for at least half the field; if none are,
+  // floor the effective weight high so market (which prices in real-world info this model
+  // simply doesn't have for this race) dominates instead of two noisy percentages.
+  const richKeys = ["form", "surf", "dist", "cond", "h2h", "fig", "pace", "clsMove", "connF"];
+  const richCoverage = richKeys.filter((k) =>
+    rows.filter((r) => r[k] != null).length >= Math.ceil(rows.length / 2)
+  ).length;
+  const effMW = richCoverage === 0 ? Math.max(MW, 0.88) : MW;
   let bSum = 0;
   rows.forEach((r) => {
-    r.bRaw = r.mP != null ? Math.pow(r.mP, MW) * Math.pow(r.fP, 1 - MW) : r.fP;
+    r.bRaw = r.mP != null ? Math.pow(r.mP, effMW) * Math.pow(r.fP, 1 - effMW) : r.fP;
     bSum += r.bRaw;
   });
   rows.forEach((r) => { r.win = r.bRaw / bSum; });
-  return { rows, off, bucket };
+  return { rows, off, bucket, dataRich: richCoverage > 0 };
 }
 
 function analyzeRace(race, entities, local, marketW) {
   const base = computeRows(race, entities, local, marketW);
   if (!base) return null;
-  const { rows, off, bucket } = base;
+  const { rows, off, bucket, dataRich } = base;
 
   // Exponential-race sampling: E_i = -ln(U)/s_i, sort ascending = one exact Plackett–Luce
   // draw of the FULL finish order. Statistically identical to sequential removal (verified
@@ -454,7 +469,7 @@ function analyzeRace(race, entities, local, marketW) {
   const proj = rows.slice().sort((a, b) => b.win - a.win);
   const top = (m, n) => Object.entries(m).sort((a, b) => b[1] - a[1]).slice(0, n)
     .map(([k, c]) => ({ combo: k.split(">").map((i) => rows[+i].e), p: c / SIMS }));
-  return { rows, proj, exactas: top(exacta, 5), trifectas: top(trifecta, 5), superfectas: N >= 4 ? top(superfecta, 5) : [], off, bucket };
+  return { rows, proj, exactas: top(exacta, 5), trifectas: top(trifecta, 5), superfectas: N >= 4 ? top(superfecta, 5) : [], off, bucket, dataRich };
 }
 
 /* ---- Model grading & self-calibration ---- */
@@ -1599,6 +1614,15 @@ function RaceView({ race, entities, local, onBack, onUpdate, onDelete, onEnrich,
           </div>
         )}
       </div>
+
+      {analysis && !analysis.dataRich && (
+        <div className="note" style={{ margin: "12px 0", padding: "10px 12px", border: "1px solid var(--brassD)", borderRadius: 6, color: "var(--brassD)", fontWeight: 600 }}>
+          ⚠ Sparse data this race — no form, figures, pace, or splits for enough of the
+          field to trust. The model is leaning almost entirely on market odds rather than
+          its own factors, on purpose. Win% here should track close to fair odds; treat any
+          horse showing well above its morning line with real skepticism.
+        </div>
+      )}
 
       {/* Projected order tote strip */}
       {analysis && (
