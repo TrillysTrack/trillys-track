@@ -183,7 +183,7 @@ function paceFactor(style, fieldStyles) {
 
 function deriveLocal(races) {
   const mk = () => ({ starts: 0, wins: 0, top3: 0 });
-  const horses = {}, jockeys = {}, trainers = {}, owners = {}, h2h = {};
+  const horses = {}, jockeys = {}, trainers = {}, owners = {}, h2h = {}, postBias = {};
   for (const r of races) {
     if (!r.results || !r.results.length) continue;
     const posOf = {};
@@ -191,6 +191,8 @@ function deriveLocal(races) {
     const rTurf = (r.surface || "").toLowerCase().includes("turf");
     const rBucket = distBucket(r.distanceF);
     const rOff = OFF_TRACKS.some((w) => (r.condition || "").toUpperCase().includes(w));
+    const liveEntries = (r.entries || []).filter((e) => !e.scratched);
+    const fieldSize = liveEntries.length;
     for (const e of r.entries || []) {
       if (e.scratched) continue;
       const fin = posOf[(e.horse || "").toLowerCase()];
@@ -207,6 +209,19 @@ function deriveLocal(races) {
       if (hk) {
         horses[hk].hist = horses[hk].hist || [];
         horses[hk].hist.push({ id: r.id, date: r.date, fin, turf: rTurf, bucket: rBucket, off: rOff, cls: classRating(r.raceType, r.purse) });
+      }
+      // Real post-position outcomes, bucketed by track/surface/distance-type/tercile — this
+      // replaces guesswork with what actually happened. Posts are grouped into thirds of the
+      // field (not raw post number) since "post 9" means something different in a 6-horse
+      // field than an 11-horse field; a fixed-post approach would badly fragment the sample.
+      const p = Number(e.post) || 0;
+      if (p && fieldSize >= 4) {
+        const third = Math.ceil(fieldSize / 3);
+        const terc = p <= third ? "in" : p > fieldSize - third ? "out" : "mid";
+        const pbKey = `${r.track}|${rTurf ? "turf" : "dirt"}|${rBucket || "na"}|${terc}`;
+        postBias[pbKey] = postBias[pbKey] || { starts: 0, wins: 0 };
+        postBias[pbKey].starts++;
+        if (fin === 1) postBias[pbKey].wins++;
       }
     }
     // head-to-head among finishers in this race
@@ -227,7 +242,7 @@ function deriveLocal(races) {
       }
     }
   }
-  return { horses, jockeys, trainers, owners, h2h };
+  return { horses, jockeys, trainers, owners, h2h, postBias };
 }
 
 // Effective win% blending AI-enriched baseline with locally recorded results
@@ -363,11 +378,31 @@ function computeRows(race, entities, local, marketW, excludeId) {
     if (connMean != null && connRaw[_i] != null) {
       connF = Math.max(-1.2, Math.min(1.2, (connRaw[_i] - connMean) / 0.09));
     }
+    // Post-position bias: empirical, computed from your own logged results (see deriveLocal),
+    // not a guess. Compares this post's tercile win rate against the OTHER two terciles in
+    // the same track/surface/distance-type cohort (so it's field-relative, like connF), shrunk
+    // toward neutral by sample size. Falls back to a rough Saratoga-specific heuristic only
+    // when there isn't enough real data yet for this cohort — that fallback should fade out
+    // entirely as results accumulate over the meet.
     let post = 0;
     const p = Number(e.post) || 0;
-    if ((race.track || "").toLowerCase().includes("saratoga")) {
-      if (isTurf && race.distanceF >= 8) { if (p >= 9) post = -0.18; else if (p <= 4) post = 0.05; }
-      else if (!isTurf && race.distanceF <= 6.5) { if (p === 1) post = 0.03; else if (p >= 10) post = -0.06; }
+    if (p && live.length >= 4) {
+      const third = Math.ceil(live.length / 3);
+      const terc = p <= third ? "in" : p > live.length - third ? "out" : "mid";
+      const surfKey = isTurf ? "turf" : "dirt";
+      const cohortBase = `${race.track}|${surfKey}|${bucket || "na"}`;
+      const cells = ["in", "mid", "out"].map((t) => local.postBias?.[`${cohortBase}|${t}`]).filter(Boolean);
+      const cohortStarts = cells.reduce((s, c) => s + c.starts, 0);
+      const rec = local.postBias?.[`${cohortBase}|${terc}`];
+      if (cohortStarts >= 20 && rec && rec.starts >= 6) {
+        const cohortRate = cells.reduce((s, c) => s + c.wins, 0) / cohortStarts;
+        const shrunk = shrinkPct(rec.wins, rec.starts, cohortRate, 8);
+        post = Math.max(-0.3, Math.min(0.3, (shrunk - cohortRate) * 2.5));
+      } else if ((race.track || "").toLowerCase().includes("saratoga")) {
+        // Thin-sample fallback — rough priors, not measured. Fades out as real data accumulates.
+        if (isTurf && race.distanceF >= 8) { if (p >= 9) post = -0.18; else if (p <= 4) post = 0.05; }
+        else if (!isTurf && race.distanceF <= 6.5) { if (p === 1) post = 0.03; else if (p >= 10) post = -0.06; }
+      }
     }
 
     let score = 0;
@@ -558,7 +593,7 @@ function gradeBet(bet, races) {
 }
 
 /* ================= CLAUDE API ================= */
-async function askClaude(prompt, useSearch, useFetch) {
+async function askClaude(prompt, useSearch, useFetch, maxHops = 6) {
   const tools = [];
   if (useSearch) tools.push({ type: "web_search_20250305", name: "web_search" });
   if (useFetch) tools.push({ type: "web_fetch_20250910", name: "web_fetch", max_uses: 5 });
@@ -566,7 +601,7 @@ async function askClaude(prompt, useSearch, useFetch) {
   if (useFetch) headers["anthropic-beta"] = "web-fetch-2025-09-10";
   let messages = [{ role: "user", content: prompt }];
   let rateRetries = 0; // 429/concurrency errors get their own backoff budget, not shared with hops
-  for (let hop = 0; hop < 6; hop++) {
+  for (let hop = 0; hop < maxHops; hop++) {
     const body = { model: "claude-sonnet-4-6", max_tokens: 1000, messages };
     if (tools.length) body.tools = tools;
 
@@ -665,8 +700,8 @@ function pluckJSON(text) {
   catch { return repairJSON(clean); }
 }
 // Ask for JSON with a second-chance reformat pass if the first response can't be parsed
-async function askForJSON(prompt, useSearch, useFetch) {
-  const text = await askClaude(prompt, useSearch, useFetch);
+async function askForJSON(prompt, useSearch, useFetch, maxHops = 6) {
+  const text = await askClaude(prompt, useSearch, useFetch, maxHops);
   try { return pluckJSON(text); }
   catch (e1) {
     const fixed = await askClaude(
@@ -1108,7 +1143,11 @@ export default function App() {
 
   const enrichEntity = async (type, name) => {
     const singular = { horses: "horse", jockeys: "jockey", trainers: "trainer", owners: "owner" }[type];
-    const ai = await askForJSON(enrichPrompt(singular, name), true);
+    // Capped at 2 hops (was inheriting the default 6 meant for complex race-card pulls).
+    // A career-stats lookup doesn't need 6 rounds of search-and-reread; each extra hop
+    // resends the full growing conversation, so hop count is the dominant cost driver —
+    // uncapped, one race's worth of enrichment (20-30 names) could run several dollars.
+    const ai = await askForJSON(enrichPrompt(singular, name), true, false, 2);
     if (ai.error) throw new Error(ai.error);
     const cur = entRef.current || entities;
     const next = { ...cur, [type]: { ...cur[type], [name]: { ai, updatedAt: new Date().toISOString() } } };
@@ -1473,7 +1512,7 @@ function RaceView({ race, entities, local, onBack, onUpdate, onDelete, onEnrich,
 
   const setField = (k, v) => onUpdate({ ...race, [k]: v });
   const toggleScratch = (i) => onUpdate({ ...race, entries: race.entries.map((e, j) => (j === i ? { ...e, scratched: !e.scratched } : e)) });
-  const setML = (i, v) => onUpdate({ ...race, entries: race.entries.map((e, j) => (j === i ? { ...e, ml: v } : e)) });
+  const setML = (i, v) => onUpdate({ ...race, entries: race.entries.map((e, j) => (j === i ? { ...e, ml: v, liveOdds: null } : e)) });
 
   const enrichAll = async () => {
     setErr(null);
@@ -1711,7 +1750,10 @@ function RaceView({ race, entities, local, onBack, onUpdate, onDelete, onEnrich,
                       </div>
                     )}
                   </td>
-                  <td><input value={e.ml || ""} onChange={(ev) => setML(i, ev.target.value)} style={{ width: 62, padding: "4px 6px", fontSize: 12.5 }} className="mono" /></td>
+                  <td>
+                    <input value={e.ml || ""} onChange={(ev) => setML(i, ev.target.value)} style={{ width: 62, padding: "4px 6px", fontSize: 12.5 }} className="mono" />
+                    {e.liveOdds && <div className="note" style={{ fontSize: 10, marginTop: 2, color: "var(--good)" }}>live {e.liveOdds}</div>}
+                  </td>
                   <td className="mono" style={{ fontWeight: 600, color: "var(--silks)" }}>{row ? fmtPct(row.win) : "—"}</td>
                   <td style={{ minWidth: 70 }}>{row ? <Bar p={row.win} /> : null}</td>
                   <td className="mono">{row ? fmtPct(row.place) : "—"}</td>
@@ -1856,6 +1898,7 @@ function CSVImport({ onBulk, setErr }) {
         ts: idx("trainer_meet_starts"), tw: idx("trainer_meet_wins"), twp: idx("trainer_meet_win_pct"), tt3: idx("trainer_meet_top3_pct"),
         os: idx("owner_meet_starts"), ow: idx("owner_meet_wins"), owp: idx("owner_meet_win_pct"), ot3: idx("owner_meet_top3_pct"),
         asOf: idx("stats_as_of"), srcE: idx("entries_source_url"), srcS: idx("stats_source_url"), ret: idx("retrieved_at"),
+        curOdds: idx("current_odds"), status: idx("status"),
       };
       for (const [lbl, i] of [["date/race_date", I.date], ["track", I.track], ["race/race_number", I.race], ["horse", I.horse]]) {
         if (i === -1) throw new Error(`Missing required column "${lbl}". Need at least date, track, race, horse (finish optional). Standard header: ${CSV_COLS.join(",")}`);
@@ -1884,6 +1927,14 @@ function CSVImport({ onBulk, setErr }) {
           jockey: cell(r, I.jockey), trainer: cell(r, I.trainer), owner: cell(r, I.owner),
           ml: cell(r, I.ml), scratched: false,
         };
+        // Scraper's current_odds is real tote data — feed it straight in as liveOdds so the
+        // model uses it without needing the AI "Live odds" pull (which needs an API key).
+        // "SCR" in that column (or an explicit status column) means the scraper caught a
+        // late scratch that the entries list itself didn't flag.
+        const curOddsRaw = cell(r, I.curOdds);
+        const statusRaw = cell(r, I.status).toLowerCase();
+        if (statusRaw === "scratched" || curOddsRaw.toUpperCase() === "SCR") entry.scratched = true;
+        else if (curOddsRaw && /^\d+(\.\d+)?(\/\d+(\.\d+)?)?$/.test(curOddsRaw.trim())) entry.liveOdds = curOddsRaw.trim();
         // Official meet stats (drive the connF factor + RaceView display). Store only when present.
         if (numOrNull(cell(r, I.js)) != null || numOrNull(cell(r, I.jw)) != null || numOrNull(cell(r, I.jwp)) != null) {
           entry.jStarts = numOrNull(cell(r, I.js)); entry.jWins = numOrNull(cell(r, I.jw)); entry.jWinPct = numOrNull(cell(r, I.jwp)); entry.jTop3Pct = numOrNull(cell(r, I.jt3)); statLines++;
@@ -1916,7 +1967,7 @@ function CSVImport({ onBulk, setErr }) {
       <div className="note" style={{ marginBottom: 8 }}>
         Bulk-load purchased/exported history or an upcoming card. One row per runner, header row required:
         <span className="mono" style={{ display: "block", marginTop: 4, fontSize: 11, background: "#EFE7D2", padding: "6px 8px", borderRadius: 4 }}>{CSV_COLS.join(",")}</span>
-        <span style={{ display: "block", marginTop: 4 }}>Required: date, track, race, horse (finish optional — leave blank for upcoming cards). Also accepts the NYRA export directly (race_date, race_number, program_number, morning_line, distance like "5 1/2F", and jockey/trainer/owner meet stats) — official win% feeds the Connections (meet) factor. Races with finishes auto-populate results, records, and the head-to-head index.</span>
+        <span style={{ display: "block", marginTop: 4 }}>Required: date, track, race, horse (finish optional — leave blank for upcoming cards). Also accepts the NYRA export directly (race_date, race_number, program_number, morning_line, distance like "5 1/2F", jockey/trainer/owner meet stats, current_odds, and status) — official win% feeds the Connections (meet) factor, current_odds feeds live tote pricing (no AI pull needed), and status auto-detects late scratches. Races with finishes auto-populate results, records, and the head-to-head index.</span>
       </div>
       <input type="file" accept=".csv,.txt" onChange={(e) => {
         const f = e.target.files?.[0]; if (!f) return;
