@@ -406,12 +406,15 @@ function computeRows(race, entities, local, marketW, excludeId) {
     }
 
     let score = 0;
-    // Weight scaled to backtest-proven edge, not raw magnitude: jockey cleared only
-    // 56.2% above-average-on-winner (marginal) vs trainer's 60.2% (real) — jockey was
-    // previously weighted HIGHER than trainer (3.2 vs 3.0), which let jockey identity
-    // (especially high-mount-volume riders) dominate the score more than the evidence
-    // supports. Rescaled proportionally to the edge each factor actually showed.
-    score += 1.8 * (jP - 0.12);
+    // Weight set to the validated 2025 walk-forward number (saratoga_2025_backfill_analysis.md),
+    // not the live in-session guess from 7/17. That analysis found jockey (56.2%) and trainer
+    // (60.2%) are the ONLY two factors that cleared a real predictive bar across the full 2025
+    // meet, and recommended weighting both near the top of the scale (3.2 each) — with the real
+    // fix being to cut down the OTHER factors that were adding noise, not to suppress jockey
+    // below trainer. The 7/17 rescale to 1.8 was a reasonable in-the-moment call given one bad
+    // example (Ortiz overweighting on a sparse-data race), but wasn't checked against the full
+    // season fit before shipping. Reverting to the validated number.
+    score += 3.2 * (jP - 0.12);
     score += 3.0 * (tP - 0.14);
     // Owner factor computed for diagnostic/audit display only (see Performance tab).
     // NOT scored: backtest showed 46.7% above-average-on-winner — worse than a coin
