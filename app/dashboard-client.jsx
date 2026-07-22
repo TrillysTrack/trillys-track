@@ -397,11 +397,13 @@ function computeRows(race, entities, local, marketW, excludeId) {
       if (cohortStarts >= 20 && rec && rec.starts >= 6) {
         const cohortRate = cells.reduce((s, c) => s + c.wins, 0) / cohortStarts;
         const shrunk = shrinkPct(rec.wins, rec.starts, cohortRate, 8);
-        post = Math.max(-0.3, Math.min(0.3, (shrunk - cohortRate) * 2.5));
+        // Scaled to ~30% strength (2.5 → 0.75) per validated analysis — post position was
+        // overstated relative to its real predictive value in the full-season walk-forward test.
+        post = Math.max(-0.09, Math.min(0.09, (shrunk - cohortRate) * 0.75));
       } else if ((race.track || "").toLowerCase().includes("saratoga")) {
-        // Thin-sample fallback — rough priors, not measured. Fades out as real data accumulates.
-        if (isTurf && race.distanceF >= 8) { if (p >= 9) post = -0.18; else if (p <= 4) post = 0.05; }
-        else if (!isTurf && race.distanceF <= 6.5) { if (p === 1) post = 0.03; else if (p >= 10) post = -0.06; }
+        // Thin-sample fallback, also scaled to ~30% of the original hardcoded strength.
+        if (isTurf && race.distanceF >= 8) { if (p >= 9) post = -0.054; else if (p <= 4) post = 0.015; }
+        else if (!isTurf && race.distanceF <= 6.5) { if (p === 1) post = 0.009; else if (p >= 10) post = -0.018; }
       }
     }
 
@@ -415,16 +417,23 @@ function computeRows(race, entities, local, marketW, excludeId) {
     // example (Ortiz overweighting on a sparse-data race), but wasn't checked against the full
     // season fit before shipping. Reverting to the validated number.
     score += 3.2 * (jP - 0.12);
-    score += 3.0 * (tP - 0.14);
+    // Raised to match jockey (3.2), per the validated 2025 walk-forward analysis — trainer
+    // and jockey were the only two factors that cleared a real predictive bar (60.2%/56.2%).
+    score += 3.2 * (tP - 0.14);
     // Owner factor computed for diagnostic/audit display only (see Performance tab).
     // NOT scored: backtest showed 46.7% above-average-on-winner — worse than a coin
     // flip, i.e. noise, not signal. Re-enable only if a larger sample proves otherwise.
     // score += 1.0 * (oP - 0.13);
-    if (form != null) score += 2.4 * (form - 0.33);
-    if (surf != null) score += 1.8 * (surf - 0.12);
-    if (dist != null) score += 1.4 * (dist - 0.12);
+    // Cut per validated analysis (2.4→1.0): form was adding noise more than signal
+    // in the walk-forward test, without real speed figures to anchor it.
+    if (form != null) score += 1.0 * (form - 0.33);
+    // Cut per validated analysis (1.8→0.6, 1.4→0.5): surface/distance splits were
+    // actively misleading as coded, absent real figure data to cross-check them against.
+    if (surf != null) score += 0.6 * (surf - 0.12);
+    if (dist != null) score += 0.5 * (dist - 0.12);
     if (cond != null) score += 1.6 * (cond - 0.12);
-    if (h2hF != null) score += 0.8 * h2hF;
+    // Cut per validated analysis (0.8→0.5).
+    if (h2hF != null) score += 0.5 * h2hF;
     if (fig != null) score += 3.4 * fig;          // heaviest horse factor — figures earn it
     if (figTrend != null) score += 0.7 * figTrend;
     if (pace != null) score += 1.2 * pace;
@@ -447,7 +456,10 @@ function computeRows(race, entities, local, marketW, excludeId) {
     rows.forEach((r) => { r.mP = (r.mp ?? 0.03) / mSum; });
   }
 
-  const MW = marketW == null ? 0.62 : marketW;
+  // Default is the validated 2025 walk-forward baseline (0.85), used until live calibration
+  // (5+ graded races) takes over — was 0.62, which undertrusted the market relative to what
+  // the full-season backtest actually found.
+  const MW = marketW == null ? 0.85 : marketW;
   // Data-richness guard: the global calibrated weight assumes a "typical" mix of factors.
   // A race running on jockey%/trainer% alone (form, figs, pace, surf/dist splits, connF —
   // all null) has almost nothing real behind fP beyond two thin percentages, but softmax
@@ -550,8 +562,8 @@ function gradeAll(races, entities, local, marketW) {
 const BLEND_CANDIDATES = [0.35, 0.5, 0.62, 0.75, 0.85, 0.9, 0.95, 1.0];
 function calibrate(races, entities, local) {
   const graded = races.filter((r) => r.results?.length && (r.entries || []).filter((e) => !e.scratched).length >= 3);
-  if (graded.length < 5) return { marketW: 0.62, n: graded.length, tuned: false };
-  let best = 0.62, bestLL = -Infinity;
+  if (graded.length < 5) return { marketW: 0.85, n: graded.length, tuned: false };
+  let best = 0.85, bestLL = -Infinity;
   for (const w of BLEND_CANDIDATES) {
     let ll = 0, n = 0;
     for (const r of graded) {
@@ -891,7 +903,7 @@ export default function App() {
 
   const local = useMemo(() => deriveLocal(races || []), [races]);
   const tune = useMemo(
-    () => (races && entities ? calibrate(races, entities, local) : { marketW: 0.62, n: 0, tuned: false }),
+    () => (races && entities ? calibrate(races, entities, local) : { marketW: 0.85, n: 0, tuned: false }),
     [races, entities, local]
   );
 
