@@ -16,6 +16,22 @@ async function ensureTable() {
 }
 
 export async function GET(req: NextRequest) {
+  // ?prefix= returns every key under a namespace in one round trip (the mentions dashboard
+  // stores settled history per company series and loads it all at once).
+  const prefix = req.nextUrl.searchParams.get("prefix");
+  if (prefix) {
+    if (prefix.length < 3) return NextResponse.json({ error: "Prefix too short" }, { status: 400 });
+    const pattern = prefix.replace(/[\\%_]/g, (c) => "\\" + c) + "%";
+    try {
+      await ensureTable();
+      const { rows } = await sql`SELECT key, value FROM kv_store WHERE key LIKE ${pattern} ESCAPE '\\' ORDER BY key;`;
+      return NextResponse.json({ items: rows }, { status: 200 });
+    } catch (err: any) {
+      console.error("kv prefix GET failed", err);
+      return NextResponse.json({ error: err?.message || "Database error" }, { status: 500 });
+    }
+  }
+
   const key = req.nextUrl.searchParams.get("key");
   if (!key) return NextResponse.json({ error: "Missing ?key=" }, { status: 400 });
 
