@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import {
   parseDateCode, parseEventTicker, parseMarketTicker, priceField, quoteOf, refPrice, termOf, termKey,
   normalizeMarket, packHistory, unpackHistory, etMidnightTs, priceAtFromCandles, paginate, makeGetter,
-  syncSeriesHistory, companyNameOf,
+  syncSeriesHistory, companyNameOf, discoverOpenEarningsEvents,
 } from "../../lib/mentions/kalshi.mjs";
 
 test("ticker parsing", () => {
@@ -116,4 +116,26 @@ test("syncSeriesHistory joins outcomes with pre-call prices", async () => {
   assert.equal(rows.length, 2);
   assert.equal(rows[0].y, 1); assert.ok(Math.abs(rows[0].pMid - 0.82) < 1e-12);
   assert.equal(rows[1].y, 0); assert.equal(rows[1].pAsk, 0.26);
+});
+
+test("discoverOpenEarningsEvents scans without nested markets, then fetches only mention events", async () => {
+  const seen = [];
+  const get = async (path, params) => {
+    seen.push([path, params]);
+    if (path === "/events") return { events: [{ event_ticker: "KXEARNINGSMENTIONAAPL-26OCT30", series_ticker: "KXEARNINGSMENTIONAAPL" }, { event_ticker: "KXFED-26DEC", series_ticker: "KXFED" }], cursor: "" };
+    if (path === "/events/KXEARNINGSMENTIONAAPL-26OCT30") return { event: { event_ticker: "KXEARNINGSMENTIONAAPL-26OCT30", title: "What will Apple say during their next earnings call?" }, markets: [{ ticker: "KXEARNINGSMENTIONAAPL-26OCT30-AI" }] };
+    throw new Error("unexpected " + path);
+  };
+  const evs = await discoverOpenEarningsEvents(get);
+  assert.equal(evs.length, 1);
+  assert.equal(evs[0].markets.length, 1);
+  assert.equal(seen[0][1].with_nested_markets, undefined);
+});
+
+test("syncSeriesHistory skips events already stored", async () => {
+  const get = async (path) => {
+    if (path === "/events") return { events: [{ event_ticker: "KXEARNINGSMENTIONABC-26MAR03", markets: [{ ticker: "KXEARNINGSMENTIONABC-26MAR03-AI", result: "yes" }] }], cursor: "" };
+    throw new Error("should not fetch prices for a known event");
+  };
+  assert.deepEqual(await syncSeriesHistory(get, "KXEARNINGSMENTIONABC", { known: new Set(["KXEARNINGSMENTIONABC-26MAR03"]) }), []);
 });
