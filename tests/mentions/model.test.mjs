@@ -163,3 +163,14 @@ test("walk-forward scoring window: earlier calls train, only window calls are sc
   assert.equal(win.window.date, from);
   assert.ok(win.window.trainRows > 0 && win.window.fitM > 0);
 });
+
+test("Kelly sim never commits more than the day's exposure cap", () => {
+  const rows = synth(9, { companies: 25, terms: 20, quarters: 4, priceNoise: 0.35 });
+  const res = walkForward(rows, { minHistory: 0, minEdge: 0, kellyFraction: 1, maxBetPct: 0.2, maxDayExposure: 0.5 });
+  const start = new Map(res.equity.map((e, i, a) => [e.date, i ? a[i - 1].bankroll : res.params.bankroll]));
+  const byDate = new Map();
+  for (const b of res.bets) byDate.set(b.date, (byDate.get(b.date) || 0) + b.contracts * (b.price + 0.07 * b.price * (1 - b.price)));
+  assert.ok(byDate.size > 0);
+  for (const [d, c] of byDate) assert.ok(c <= 0.5 * start.get(d) + 1e-9, `${d}: ${c} > half of ${start.get(d)}`);
+  assert.ok(res.trading.naiveNo.bets > 0);
+});

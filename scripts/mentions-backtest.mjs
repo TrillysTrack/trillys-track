@@ -253,7 +253,8 @@ function report(label, res) {
   console.log(`\n== Trading sim (pre-call quotes, ${pct(res.params.feeRate)} fee formula, edge ≥ ${res.params.minEdge}) ==`);
   console.log(`  bets ${trading.bets}  win ${pct(trading.bets ? trading.wins / trading.bets : null)}  avg edge ${fmt(trading.avgEdge, 3)}  YES share ${pct(trading.yesShare)}`);
   console.log(`  flat ${res.params.flatContracts}/bet: P&L $${fmt(trading.flatPnl, 2)}  ROI ${pct(trading.flatRoi)}`);
-  console.log(`  ${res.params.kellyFraction}× Kelly from $${res.params.bankroll}: P&L $${fmt(trading.kellyPnl, 2)}  ROI ${pct(trading.kellyRoi)}`);
+  console.log(`  ${res.params.kellyFraction}× Kelly from $${res.params.bankroll} (day exposure ≤ ${res.params.maxDayExposure}× bankroll): P&L $${fmt(trading.kellyPnl, 2)}  ROI ${pct(trading.kellyRoi)}`);
+  if (trading.naiveNo) console.log(`  reference — buy NO on every priced market: ${trading.naiveNo.bets} bets, flat ROI ${pct(trading.naiveNo.roi)}`);
   const bs = callBootstrap(res);
   if (bs) {
     console.log(`\n== Uncertainty (resampling whole calls, ${bs.calls} priced calls) ==`);
