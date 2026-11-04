@@ -84,6 +84,9 @@ test("predictRow ignores transcripts dated on/after the call (leakage guard)", (
   const clean = predictRow({ ...base, tx: [{ date: "2026-02-01", count: 0 }] }, stats, coefs);
   const leaky = predictRow({ ...base, tx: [{ date: "2026-02-01", count: 0 }, { date: "2026-05-01", count: 9 }] }, stats, coefs);
   close(clean.pFinal, leaky.pFinal, 1e-12);
+  // A transcript dated two days before the call is treated as possibly the same call.
+  const nearby = predictRow({ ...base, tx: [{ date: "2026-02-01", count: 0 }, { date: "2026-04-29", count: 9 }] }, stats, coefs);
+  close(clean.pFinal, nearby.pFinal, 1e-12);
 });
 
 // Synthetic world: each company×term has a persistent latent probability; markets are priced

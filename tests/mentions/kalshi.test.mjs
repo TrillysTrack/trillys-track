@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import {
   parseDateCode, parseEventTicker, parseMarketTicker, priceField, quoteOf, refPrice, termOf, termKey,
   normalizeMarket, packHistory, unpackHistory, etMidnightTs, priceAtFromCandles, paginate, makeGetter,
-  syncSeriesHistory, companyNameOf, discoverOpenEarningsEvents,
+  syncSeriesHistory, companyNameOf, discoverOpenEarningsEvents, callTiming, parseLooseDate, looksPostCall,
 } from "../../lib/mentions/kalshi.mjs";
 
 test("ticker parsing", () => {
@@ -94,28 +94,72 @@ test("makeGetter retries 429 and routes through a proxy", async () => {
   await assert.rejects(bad("/x"), /Kalshi 404 on \/x: nope/);
 });
 
-test("syncSeriesHistory joins outcomes with pre-call prices", async () => {
-  const ev = {
-    event_ticker: "KXEARNINGSMENTIONABC-26MAR03", series_ticker: "KXEARNINGSMENTIONABC", title: "What will ABC say during their next earnings call?",
+test("syncSeriesHistory joins live + archived markets, dates calls by YES closes, prices pre-call", async () => {
+  // Live event: stated date consistent with when YES markets closed.
+  const live = {
+    event_ticker: "KXEARNINGSMENTIONABC-26MAR03", series_ticker: "KXEARNINGSMENTIONABC", sub_title: "On Mar 3, 2026", title: "What will ABC say during their next earnings call?",
     markets: [
-      { ticker: "KXEARNINGSMENTIONABC-26MAR03-AI", yes_sub_title: "AI", result: "yes", status: "finalized" },
-      { ticker: "KXEARNINGSMENTIONABC-26MAR03-TAR", yes_sub_title: "Tariff", result: "no", status: "finalized" },
+      { ticker: "KXEARNINGSMENTIONABC-26MAR03-AI", yes_sub_title: "AI", result: "yes", status: "finalized", close_time: "2026-03-03T22:10:00Z" },
+      { ticker: "KXEARNINGSMENTIONABC-26MAR03-TAR", yes_sub_title: "Tariff", result: "no", status: "finalized", close_time: "2026-03-04T15:00:00Z" },
       { ticker: "KXEARNINGSMENTIONABC-26MAR03-VOID", yes_sub_title: "Void", result: "", status: "finalized" },
     ],
   };
+  // Archived event whose ticker/subtitle date (Jun 30) is a placeholder; it was really a Feb call.
+  const archivedEv = { event_ticker: "KXEARNINGSMENTIONABC-26JUN30", series_ticker: "KXEARNINGSMENTIONABC", sub_title: "On Jun 30, 2026", title: "What will ABC say during their next earnings call?", markets: [] };
+  const archived = [
+    { ticker: "KXEARNINGSMENTIONABC-26JUN30-AI", event_ticker: archivedEv.event_ticker, yes_sub_title: "AI", result: "yes", close_time: "2026-02-25T23:54:53Z" },
+    { ticker: "KXEARNINGSMENTIONABC-26JUN30-CHI", event_ticker: archivedEv.event_ticker, yes_sub_title: "China", result: "no", close_time: "2026-02-26T15:00:00Z" },
+  ];
   const ref = etMidnightTs("2026-03-03");
-  const get = async (path) => {
-    if (path === "/events") return { events: [ev], cursor: "" };
-    if (path.endsWith("/candlesticks")) return {
+  const seen = [];
+  const get = async (path, params) => {
+    seen.push([path, params]);
+    if (path === "/events") return { events: [live, archivedEv], cursor: "" };
+    if (path === "/historical/markets") return { markets: archived, cursor: "" };
+    if (path === "/series/KXEARNINGSMENTIONABC/events/KXEARNINGSMENTIONABC-26MAR03/candlesticks") return {
       market_tickers: ["KXEARNINGSMENTIONABC-26MAR03-AI", "KXEARNINGSMENTIONABC-26MAR03-TAR"],
-      market_candlesticks: [[{ end_period_ts: ref - 60, yes_bid: { close: 80 }, yes_ask: { close: 84 } }], [{ end_period_ts: ref - 60, yes_bid: { close: 20 }, yes_ask: { close: 26 } }]],
+      market_candlesticks: [[{ end_period_ts: ref - 60, yes_bid: { close_dollars: "0.80" }, yes_ask: { close_dollars: "0.84" } }], [{ end_period_ts: ref - 60, yes_bid: { close: 20 }, yes_ask: { close: 26 } }]],
     };
+    // Archived candles carry dollar strings in plain fields.
+    if (path.startsWith("/historical/markets/") && path.endsWith("/candlesticks")) return { candlesticks: [{ end_period_ts: params.end_ts - 60, yes_bid: { close: "0.4200" }, yes_ask: { close: "0.4400" } }] };
     throw new Error("unexpected " + path);
   };
-  const rows = await syncSeriesHistory(get, "KXEARNINGSMENTIONABC");
-  assert.equal(rows.length, 2);
-  assert.equal(rows[0].y, 1); assert.ok(Math.abs(rows[0].pMid - 0.82) < 1e-12);
-  assert.equal(rows[1].y, 0); assert.equal(rows[1].pAsk, 0.26);
+  const stats = {};
+  const rows = await syncSeriesHistory(get, "KXEARNINGSMENTIONABC", { stats });
+  assert.equal(rows.length, 4);
+  const by = Object.fromEntries(rows.map((r) => [r.ticker, r]));
+  const ai = by["KXEARNINGSMENTIONABC-26MAR03-AI"];
+  assert.equal(ai.y, 1); assert.equal(ai.date, "2026-03-03"); assert.ok(Math.abs(ai.pMid - 0.82) < 1e-12);
+  assert.equal(by["KXEARNINGSMENTIONABC-26MAR03-TAR"].pAsk, 0.26);
+  const arch = by["KXEARNINGSMENTIONABC-26JUN30-AI"];
+  assert.equal(arch.timing, "bound");
+  assert.equal(arch.date, "2026-02-24");          // a day before the first YES close (Feb 25 ET)
+  assert.equal(arch.pBid, 0.42);                  // dollar string, not 0.42¢
+  const histCandle = seen.find(([p]) => p === "/historical/markets/KXEARNINGSMENTIONABC-26JUN30-AI/candlesticks");
+  assert.equal(histCandle[1].end_ts, Math.floor(Date.parse("2026-02-25T23:54:53Z") / 1000) - 48 * 3600);
+  assert.deepEqual({ stated: stats.stated, bound: stats.bound }, { stated: 1, bound: 1 });
+});
+
+test("callTiming trusts a stated date only when YES closes back it up", () => {
+  const yesAt = (t) => [{ result: "yes", close_time: t }];
+  // Settled the next morning: the stated date is still the call date.
+  assert.deepEqual(callTiming({ event_ticker: "KXEARNINGSMENTIONAAPL-25JUL31", sub_title: "On Jul 31, 2025" }, yesAt("2025-08-01T06:51:02Z")),
+    { date: "2025-07-31", refTs: etMidnightTs("2025-07-31"), source: "stated" });
+  // Subtitle says Mar 31, 2026 but a YES market closed on Nov 19, 2025: use the bound.
+  const t = callTiming({ event_ticker: "KXEARNINGSMENTIONNVDA-26MAR31", sub_title: "On Mar 31, 2026" }, yesAt("2025-11-20T02:27:09Z"));
+  assert.equal(t.source, "bound"); assert.equal(t.date, "2025-11-18");
+  // Old-style ticker with no day and a non-date subtitle.
+  assert.equal(callTiming({ event_ticker: "KXEARNINGSMENTIONNVDA-25FEB", sub_title: "Q4 2024" }, yesAt("2025-02-27T14:50:26Z")).source, "bound");
+  // No YES market at all: fall back to the stated date, flagged as unverified.
+  assert.equal(callTiming({ event_ticker: "KXEARNINGSMENTIONX-26MAY05", sub_title: "On May 5, 2026" }, [{ result: "no" }]).source, "stated-unverified");
+  assert.equal(parseLooseDate("Feb 25, 2026"), "2026-02-25");
+  assert.equal(parseLooseDate("Next earnings call"), null);
+});
+
+test("looksPostCall flags events already pinned at 0/1", () => {
+  const mk = (...mids) => Object.fromEntries(mids.map((m, i) => [i, { pMid: m }]));
+  assert.equal(looksPostCall(mk(0.01, 0.99, 0.01, 0.99, 0.5)), true);
+  assert.equal(looksPostCall(mk(0.01, 0.4, 0.6, 0.97, 0.5)), false);
 });
 
 test("discoverOpenEarningsEvents scans without nested markets, then fetches only mention events", async () => {
@@ -132,10 +176,18 @@ test("discoverOpenEarningsEvents scans without nested markets, then fetches only
   assert.equal(seen[0][1].with_nested_markets, undefined);
 });
 
-test("syncSeriesHistory skips events already stored", async () => {
+test("syncSeriesHistory skips events already stored (live and archived)", async () => {
   const get = async (path) => {
     if (path === "/events") return { events: [{ event_ticker: "KXEARNINGSMENTIONABC-26MAR03", markets: [{ ticker: "KXEARNINGSMENTIONABC-26MAR03-AI", result: "yes" }] }], cursor: "" };
+    if (path === "/historical/markets") return { markets: [{ ticker: "KXEARNINGSMENTIONABC-25NOV03-AI", event_ticker: "KXEARNINGSMENTIONABC-25NOV03", result: "yes" }], cursor: "" };
     throw new Error("should not fetch prices for a known event");
   };
-  assert.deepEqual(await syncSeriesHistory(get, "KXEARNINGSMENTIONABC", { known: new Set(["KXEARNINGSMENTIONABC-26MAR03"]) }), []);
+  assert.deepEqual(await syncSeriesHistory(get, "KXEARNINGSMENTIONABC", { known: new Set(["KXEARNINGSMENTIONABC-26MAR03", "KXEARNINGSMENTIONABC-25NOV03"]) }), []);
+});
+
+test("priceField reads archived dollar strings in plain fields", () => {
+  assert.equal(priceField({ close: "0.4300" }, "close"), 0.43);
+  assert.equal(priceField({ close: 43 }, "close"), 0.43);
+  assert.equal(priceField({ close: 0.43 }, "close"), 0.43);
+  assert.equal(priceField({ close: null }, "close"), null);
 });
