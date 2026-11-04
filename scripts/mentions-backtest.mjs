@@ -5,7 +5,10 @@
    node scripts/mentions-backtest.mjs --series NVDA,TSLA # specific companies
    node scripts/mentions-backtest.mjs --transcripts      # also backfill prior-call transcripts
    node scripts/mentions-backtest.mjs --probe            # print raw API shapes and exit
-   Options: --limit N  --refresh  --refresh-transcripts  --no-prices  --min-edge 0.03  --kelly 0.25
+   node scripts/mentions-backtest.mjs --refresh --live-only --merge-cache --score-days 14 --transcripts --tx-window-only
+                                                         # quick: score only the last 14 days of calls
+   Options: --limit N  --refresh  --live-only  --merge-cache  --refresh-transcripts  --no-prices
+            --score-days N  --tx-window-only  --tx-max 4  --min-edge 0.03  --kelly 0.25
             --interval-ms 125  --fool-interval-ms 700  --out report.json
 
    Synced history is cached in .cache/mentions-history.json and transcript counts in
@@ -77,11 +80,18 @@ async function loadHistory() {
   const lim = pLimit(2);
   let done = 0;
   await Promise.all(tickers.map((t) => lim(async () => {
-    try { rows.push(...(await syncSeriesHistory(get, t, { withPrices: !flag("no-prices"), stats }))); }
+    try { rows.push(...(await syncSeriesHistory(get, t, { withPrices: !flag("no-prices"), stats, historical: !flag("live-only") }))); }
     catch (e) { stats.failedSeries.push(`${t}: ${e.message}`); console.log(`  ${t}: ${e.message}`); }
     done++;
     if (done % 10 === 0 || done === tickers.length) console.log(`  ${done}/${tickers.length} series, ${rows.length} settled markets`);
   })));
+  // --merge-cache keeps rows from an earlier sync (e.g. archived history) that this one didn't fetch.
+  if (flag("merge-cache") && fs.existsSync(CACHE)) {
+    const have = new Set(rows.map((r) => r.ticker));
+    const prev = JSON.parse(fs.readFileSync(CACHE, "utf8")).rows.filter((r) => !have.has(r.ticker));
+    console.log(`  merged ${prev.length} previously cached markets`);
+    rows.push(...prev);
+  }
   const cached = { syncedAt: new Date().toISOString(), series: tickers.length, stats, retries, rows };
   save(CACHE, cached);
   return cached;
@@ -120,17 +130,18 @@ function transcriptLinks(html, company) {
   return [...out.values()];
 }
 
-async function backfillTranscripts(rows) {
+async function backfillTranscripts(rows, { companies = null, maxPerCompany = 12, until = null } = {}) {
   const cache = !flag("refresh-transcripts") && fs.existsSync(TX_CACHE) ? JSON.parse(fs.readFileSync(TX_CACHE, "utf8")) : {};
   const byCo = new Map();
-  for (const r of rows) (byCo.get(r.company) || byCo.set(r.company, []).get(r.company)).push(r);
+  for (const r of rows) if (!companies || companies.has(r.company)) (byCo.get(r.company) || byCo.set(r.company, []).get(r.company)).push(r);
   console.log(`\nBackfilling transcripts for ${byCo.size} companies from fool.com…`);
   let n = 0;
   for (const [co, list] of byCo) {
     n++;
     const terms = new Map(list.map((r) => [r.termKey, r.term]));
     const dates = list.map((r) => r.date).sort();
-    const from = shift(dates[0], -400), to = dates[dates.length - 1];
+    const to = until?.[co] || dates[dates.length - 1];
+    const from = until?.[co] ? shift(to, -400) : shift(dates[0], -400);
     const entry = cache[co] || { calls: [], failures: [] };
     if (!entry.links) {
       let page = null;
@@ -141,7 +152,7 @@ async function backfillTranscripts(rows) {
       entry.links = page ? transcriptLinks(page, co) : [];
       if (!page) entry.noQuotePage = true;
     }
-    const wanted = entry.links.filter((l) => l.pubDate >= from && l.pubDate <= shift(to, 10)).sort((a, b) => b.pubDate.localeCompare(a.pubDate)).slice(0, 12);
+    const wanted = entry.links.filter((l) => l.pubDate >= from && l.pubDate <= shift(to, 10)).sort((a, b) => b.pubDate.localeCompare(a.pubDate)).slice(0, maxPerCompany);
     for (const l of wanted) {
       const have = entry.calls.find((c) => c.url === l.url);
       if (have && [...terms.keys()].every((k) => k in have.counts)) continue;
@@ -179,6 +190,12 @@ function report(label, res) {
   console.log(`\n================ ${label} ================`);
   console.log(`${counts.rows} settled markets · ${counts.events} calls · ${counts.dates} call dates · scored ${counts.scored} · with pre-call price ${counts.priced} · with transcripts ${counts.withTx}`);
   console.log(`YES base rate (scored): ${pct(res.baseRate)}`);
+  if (res.window) {
+    const w = res.window;
+    console.log(`Scoring window ${res.params.scoreFrom} → ${res.params.scoreTo}: ${counts.scoredEvents} calls, ${counts.scored} markets (${counts.priced} with a pre-call price, ${counts.withTx} with transcripts)`);
+    console.log(`At window start the model had ${w.histMarkets} earlier settled markets for H; blend weights: ${w.fitM ? `fitted on ${w.fitM} priced rows` : "DEFAULTS (fewer than minTrain rows of earlier data)"}${w.fitN ? "" : " / no-price model on defaults"}`);
+    console.log(`  weights used at window start [1, logit H, logit T−H, logit M]: ${w.coefs.coefM.map((c) => fmt(c, 3)).join(", ")}`);
+  }
   console.log(`\n== Accuracy (lower is better) ==`);
   console.log(`All scored markets      Brier      LogLoss`);
   for (const k of ["H", "T", "model"]) console.log(`  ${k.padEnd(20)} ${fmt(metrics.all[k].brier)}   ${fmt(metrics.all[k].logloss)}   n=${metrics.all[k].n}`);
@@ -206,13 +223,28 @@ async function main() {
   console.log(`${rows.length} settled markets · ${new Set(rows.map((r) => r.eventTicker)).size} calls · ${new Set(rows.map((r) => r.company)).size} companies · ${new Set(rows.map((r) => r.termKey)).size} distinct terms · ${dates[0]} → ${dates[dates.length - 1]}`);
   console.log(`with pre-call price: ${rows.filter((r) => r.pMid != null).length}; call dating: ${JSON.stringify(hist.stats ? Object.fromEntries(Object.entries(hist.stats).filter(([k]) => k !== "failedSeries")) : {})}; series errors: ${hist.stats?.failedSeries?.length ?? 0}; Kalshi 429/5xx retries: ${hist.retries ?? "n/a"}`);
 
-  const params = { minEdge: Number(opt("min-edge", 0.03)), kellyFraction: Number(opt("kelly", 0.25)), minHistory: Number(opt("min-history", 200)) };
+  const scoreDays = Number(opt("score-days", 0));
+  const today = new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+  const params = {
+    minEdge: Number(opt("min-edge", 0.03)), kellyFraction: Number(opt("kelly", 0.25)),
+    minHistory: Number(opt("min-history", scoreDays ? 0 : 200)),
+    ...(scoreDays ? { scoreFrom: shift(today, -scoreDays), scoreTo: today } : {}),
+  };
   const base = walkForward(rows, params);
   report("History + market (no transcripts)", base);
   const out = { coverage: { rows: rows.length, from: dates[0], to: dates[dates.length - 1], stats: hist.stats, retries: hist.retries }, base: (({ preds, ...x }) => x)(base) };
 
   if (flag("transcripts")) {
-    const cache = await backfillTranscripts(rows);
+    // --tx-window-only: only companies with calls in the scoring window, and only their most
+    // recent prior transcripts (the call's own transcript is excluded by the model's date gap).
+    let txOpts = { maxPerCompany: Number(opt("tx-max", 12)) };
+    if (flag("tx-window-only") && params.scoreFrom) {
+      const inWin = rows.filter((r) => r.date >= params.scoreFrom && r.date <= params.scoreTo);
+      const until = {};
+      for (const r of inWin) until[r.company] = until[r.company] && until[r.company] > r.date ? until[r.company] : r.date;
+      txOpts = { ...txOpts, companies: new Set(Object.keys(until)), until };
+    }
+    const cache = await backfillTranscripts(rows, txOpts);
     const cos = Object.values(cache);
     const failures = cos.flatMap((e) => e.failures || []);
     console.log(`\nTranscripts: ${cos.reduce((s, e) => s + e.calls.length, 0)} calls for ${cos.filter((e) => e.calls.length).length}/${cos.length} companies · no fool.com quote page: ${cos.filter((e) => e.noQuotePage).length} · fetch/parse failures: ${failures.length}`);

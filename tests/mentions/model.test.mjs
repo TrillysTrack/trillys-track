@@ -147,3 +147,19 @@ test("predictOpen scores open markets against history before their date", () => 
   assert.equal(out.get("T1").h.nCT, 1);
   assert.equal(out.get("T2").h.nCT, 2);
 });
+
+test("walk-forward scoring window: earlier calls train, only window calls are scored and traded", () => {
+  const rows = synth(5, { companies: 15, terms: 10, quarters: 6 });
+  const dates = [...new Set(rows.map((r) => r.date))].sort();
+  const from = dates[Math.floor(dates.length * 0.8)];
+  const all = walkForward(rows, { minHistory: 0 });
+  const win = walkForward(rows, { minHistory: 0, scoreFrom: from });
+  // Same predictions — the window only changes what is scored.
+  const byT = new Map(all.preds.map((p) => [p.ticker, p.pFinal]));
+  for (const p of win.preds) close(p.pFinal, byT.get(p.ticker), 1e-12);
+  assert.equal(win.counts.scored, rows.filter((r) => r.date >= from).length);
+  assert.ok(win.bets.every((b) => b.date >= from));
+  assert.ok(win.equity.every((e) => e.date >= from));
+  assert.equal(win.window.date, from);
+  assert.ok(win.window.trainRows > 0 && win.window.fitM > 0);
+});
