@@ -118,20 +118,39 @@ per order on Kalshi). Stake = Kelly fraction × full Kelly, capped at the max-be
 ## Testing
 
 ```bash
-npm test                                    # 35 unit tests: matcher, parser, model math, signing, SSRF guard
-npm run mentions:backtest -- --probe        # print live Kalshi response shapes
+npm test                                    # unit tests: matcher, parser, model math, signing, SSRF guard
+npm run mentions:backtest -- --probe        # print live Kalshi response shapes + historical cutoff
 npm run mentions:backtest                   # full sync + walk-forward backtest from the terminal
+npm run mentions:backtest -- --transcripts  # also backfill prior-call transcripts from fool.com
 npm run mentions:backtest -- --series NVDA,TSLA --out report.json
 ```
+
+Behind an HTTPS proxy (e.g. a sandbox), prefix with `NODE_USE_ENV_PROXY=1` — Node's built-in
+fetch ignores `HTTPS_PROXY` otherwise. Kalshi rate-limits public reads; the client spaces
+requests (`--interval-ms`, default 125) and backs off on 429 using `Retry-After`.
 
 The unit tests include a look-ahead check (flipping future outcomes must not change any earlier
 prediction) and a synthetic market where the true probabilities are known.
 
-## Known limits
+## How Kalshi's data behaves (verified against the live API)
 
-- Kalshi's API is migrating price fields from integer cents to `*_dollars` strings; the parser
-  reads either.
-- Transcript speaker detection is heuristic (Motley Fool-style `Name -- Title` headers and
-  `Name:` labels). If a transcript has no speaker labels, analyst speech can't be excluded.
+- **Archive split.** Markets settled before Kalshi's historical cutoff (`GET /historical/cutoff`)
+  disappear from `/markets` and from nested `/events` results; they're only in
+  `/historical/markets`, with candles at `/historical/markets/{ticker}/candlesticks`. Sync
+  merges both.
+- **Prices.** Live payloads use `*_dollars` fields; archived payloads put dollar strings in the
+  plain field names (`"close": "0.4300"`). Legacy integer cents are still understood.
+- **Event dates are not call dates.** Tickers and subtitles can be placeholders (an event
+  ticker dated `26JUN30` that was a February call). Settled calls are dated from the earliest
+  close of a market that resolved YES (a term can only be said once the call has started), and
+  the "pre-call" price is read at midnight ET on a stated date only when that bound confirms it,
+  otherwise 48h before the bound. Events already pinned at 0/1 at that time are left unpriced.
+- **Transcripts** must predate a call by 20+ days before they inform it, so a misdated
+  transcript can't predict its own call.
+
+## Known limits
+- Transcript speaker detection is heuristic. It handles the Motley Fool layouts seen in
+  2024–2026 (`Name -- Title` headers; `Name:` labels with a CALL PARTICIPANTS list; operators
+  labelled by name). If a transcript has no speaker labels, analyst speech can't be excluded.
 - The backtest's "pre-call" price is the prior-day close, which is conservative for after-hours
   calls (it misses the same-day earnings release).

@@ -66,7 +66,9 @@ async function api(path, { method = "GET", body } = {}) {
   if (!r.ok) throw new Error(d?.error?.message || d?.error || `HTTP ${r.status}`);
   return d;
 }
-const kget = makeGetter({ proxy: "/api/kalshi" });
+// Paced like the CLI: Kalshi rate-limits public reads, and history sync is one request per
+// archived market.
+const kget = makeGetter({ proxy: "/api/kalshi", minIntervalMs: 150 });
 
 /* ================= FORMAT ================= */
 const cents = (p) => (p == null ? "—" : `${Math.round(p * 100)}¢`);
