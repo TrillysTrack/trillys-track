@@ -162,7 +162,26 @@ test("looksPostCall flags events already pinned at 0/1", () => {
   assert.equal(looksPostCall(mk(0.01, 0.4, 0.6, 0.97, 0.5)), false);
 });
 
-test("discoverOpenEarningsEvents scans without nested markets, then fetches only mention events", async () => {
+test("discoverOpenEarningsEvents asks each earnings series for its open events", async () => {
+  const seen = [];
+  const get = async (path, params) => {
+    seen.push([path, params]);
+    if (path === "/series") return { series: [{ ticker: "KXEARNINGSMENTIONAAPL" }, { ticker: "KXEARNINGSMENTIONNVDA" }, { ticker: "KXFED" }] };
+    if (path === "/events" && params.series_ticker === "KXEARNINGSMENTIONAAPL") {
+      assert.equal(params.status, "open"); assert.equal(params.with_nested_markets, true);
+      return { events: [{ event_ticker: "KXEARNINGSMENTIONAAPL-27JAN29", series_ticker: "KXEARNINGSMENTIONAAPL", markets: [{ ticker: "KXEARNINGSMENTIONAAPL-27JAN29-AI" }] }], cursor: "" };
+    }
+    if (path === "/events" && params.series_ticker === "KXEARNINGSMENTIONNVDA") return { events: [], cursor: "" };
+    throw new Error("unexpected " + path + " " + JSON.stringify(params));
+  };
+  const evs = await discoverOpenEarningsEvents(get);
+  assert.deepEqual(evs.map((e) => e.event_ticker), ["KXEARNINGSMENTIONAAPL-27JAN29"]);
+  assert.equal(evs[0].markets.length, 1);
+  // No exchange-wide scan when the series list is available.
+  assert.ok(!seen.some(([p, q]) => p === "/events" && !q.series_ticker));
+});
+
+test("discoverOpenEarningsEvents falls back to an exchange scan without nested markets, then fetches only mention events", async () => {
   const seen = [];
   const get = async (path, params) => {
     seen.push([path, params]);
