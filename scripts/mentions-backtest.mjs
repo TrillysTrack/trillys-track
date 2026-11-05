@@ -19,13 +19,13 @@ import path from "node:path";
 import {
   makeGetter, listEarningsSeries, discoverOpenEarningsEvents, syncSeriesHistory, listSeriesEvents, pLimit, EARNINGS_PREFIX,
 } from "../lib/mentions/kalshi.mjs";
-import { htmlToText, parseTranscript, countTerm, transcriptDate } from "../lib/mentions/terms.mjs";
+import { countTerm } from "../lib/mentions/terms.mjs";
+import { makeFoolClient, findTranscriptLinks, loadTranscript } from "../lib/mentions/fool.mjs";
 import { walkForward } from "../lib/mentions/model.mjs";
 
 const args = process.argv.slice(2);
 const flag = (name) => args.includes(`--${name}`);
 const opt = (name, dflt) => { const i = args.indexOf(`--${name}`); return i >= 0 && args[i + 1] ? args[i + 1] : dflt; };
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const CACHE = path.resolve(".cache/mentions-history.json");
 const TX_CACHE = path.resolve(".cache/mentions-transcripts.json");
@@ -37,7 +37,6 @@ const get = makeGetter({
 });
 const fmt = (x, d = 4) => (x == null ? "—" : Number(x).toFixed(d));
 const pct = (x) => (x == null ? "—" : `${(x * 100).toFixed(1)}%`);
-const dayDiff = (a, b) => Math.round((Date.parse(`${b}T00:00:00Z`) - Date.parse(`${a}T00:00:00Z`)) / 86400000);
 const shift = (iso, days) => new Date(Date.parse(`${iso}T00:00:00Z`) + days * 86400000).toISOString().slice(0, 10);
 const save = (file, obj) => { fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, JSON.stringify(obj)); };
 
@@ -114,34 +113,7 @@ async function loadHistory() {
    Each company's fool.com quote page embeds its transcript list. Only that company's own
    transcripts are kept (the page also links other companies'), fetched politely, parsed with
    the same deterministic matcher as the dashboard, and reduced to per-term counts. */
-let foolNext = 0;
-async function foolGet(url) {
-  const gap = Number(opt("fool-interval-ms", 700));
-  for (let attempt = 0; attempt < 3; attempt++) {
-    const now = Date.now(), at = Math.max(now, foolNext);
-    foolNext = at + gap;
-    if (at > now) await sleep(at - now);
-    try {
-      const res = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0 (compatible; TrillysTrack/1.0; transcript research)", Accept: "text/html" } });
-      if (res.status === 429 || res.status >= 500) { foolNext = Date.now() + 5000 * (attempt + 1); continue; }
-      return { status: res.status, text: res.ok ? await res.text() : "" };
-    } catch (e) {
-      if (attempt === 2) return { status: 0, error: e.message, text: "" };
-    }
-  }
-  return { status: 429, text: "" };
-}
-
-function transcriptLinks(html, company) {
-  const own = new RegExp(`(^|-)${company.toLowerCase()}(-|$)`);
-  const out = new Map();
-  for (const m of html.matchAll(/call-transcripts\/(\d{4})\/(\d{2})\/(\d{2})\/([a-z0-9-]+)\//g)) {
-    if (!own.test(m[4])) continue;
-    const url = `https://www.fool.com/earnings/call-transcripts/${m[1]}/${m[2]}/${m[3]}/${m[4]}/`;
-    out.set(url, { url, pubDate: `${m[1]}-${m[2]}-${m[3]}` });
-  }
-  return [...out.values()];
-}
+const foolGet = makeFoolClient({ intervalMs: Number(opt("fool-interval-ms", 700)) });
 
 async function backfillTranscripts(rows, { companies = null, maxPerCompany = 12, until = null } = {}) {
   const cache = !flag("refresh-transcripts") && fs.existsSync(TX_CACHE) ? JSON.parse(fs.readFileSync(TX_CACHE, "utf8")) : {};
@@ -157,31 +129,20 @@ async function backfillTranscripts(rows, { companies = null, maxPerCompany = 12,
     const from = until?.[co] ? shift(to, -400) : shift(dates[0], -400);
     const entry = cache[co] || { calls: [], failures: [] };
     if (!entry.links) {
-      let page = null;
-      for (const ex of ["nasdaq", "nyse"]) {
-        const r = await foolGet(`https://www.fool.com/quote/${ex}/${co.toLowerCase()}/`);
-        if (r.status === 200) { page = r.text; entry.exchange = ex; break; }
-      }
-      entry.links = page ? transcriptLinks(page, co) : [];
-      if (!page) entry.noQuotePage = true;
+      const found = await findTranscriptLinks(foolGet, co);
+      entry.links = found.links; entry.exchange = found.exchange;
+      if (!found.exchange) entry.noQuotePage = true;
     }
     const wanted = entry.links.filter((l) => l.pubDate >= from && l.pubDate <= shift(to, 10)).sort((a, b) => b.pubDate.localeCompare(a.pubDate)).slice(0, maxPerCompany);
     for (const l of wanted) {
       const have = entry.calls.find((c) => c.url === l.url);
       if (have && [...terms.keys()].every((k) => k in have.counts)) continue;
       if (entry.failures.some((f) => f.url === l.url)) continue;
-      const r = await foolGet(l.url);
-      if (r.status !== 200) { entry.failures.push({ url: l.url, reason: `HTTP ${r.status}${r.error ? " " + r.error : ""}` }); continue; }
-      const text = htmlToText(r.text);
-      const parsed = parseTranscript(text);
-      if (parsed.words < 2000) { entry.failures.push({ url: l.url, reason: `only ${parsed.words} words parsed` }); continue; }
-      // Call date from the transcript header; the URL's publication date is the fallback and is
-      // never earlier than the call, so it can't leak a call into its own prediction.
-      const stated = transcriptDate(text);
-      const date = stated && stated <= l.pubDate && dayDiff(stated, l.pubDate) <= 10 ? stated : l.pubDate;
-      const counts = Object.fromEntries([...terms].map(([k, t]) => [k, countTerm(parsed, t).count]));
+      const t = await loadTranscript(foolGet, l);
+      if (t.error) { entry.failures.push({ url: l.url, reason: t.error }); continue; }
+      const counts = Object.fromEntries([...terms].map(([k, term]) => [k, countTerm(t.parsed, term).count]));
       entry.calls = entry.calls.filter((c) => c.url !== l.url);
-      entry.calls.push({ url: l.url, pubDate: l.pubDate, date, dateSource: date === stated ? "header" : "published", words: parsed.words, participants: parsed.participants, analysts: new Set(parsed.segments.filter((s) => s.role === "analyst").map((s) => s.speaker)).size, counts });
+      entry.calls.push({ url: l.url, pubDate: l.pubDate, date: t.date, dateSource: t.dateSource, words: t.words, participants: t.participants, analysts: t.analysts, counts });
     }
     entry.fetchedAt = new Date().toISOString();
     cache[co] = entry;

@@ -123,6 +123,7 @@ npm run mentions:backtest -- --probe        # print live Kalshi response shapes 
 npm run mentions:backtest                   # full sync + walk-forward backtest from the terminal
 npm run mentions:backtest -- --transcripts  # also backfill prior-call transcripts from fool.com
 npm run mentions:backtest -- --series NVDA,TSLA --out report.json
+npm run mentions:score -- AAP --weights report.json   # score one open event: H, T, final, edge, stake per term
 ```
 
 Behind an HTTPS proxy (e.g. a sandbox), prefix with `NODE_USE_ENV_PROXY=1` — Node's built-in
