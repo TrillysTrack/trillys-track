@@ -59,3 +59,14 @@ test("safeFetchText re-checks every redirect hop", async () => {
   assert.equal(ok.body, "<p>hi</p>");
   await assert.rejects(safeFetchText("https://ok.example/big", { fetchImpl: async () => new Response("x".repeat(100), { status: 200 }), lookup, maxBytes: 10 }), /too large/);
 });
+
+test("Kalshi signature: Ed25519 keys (Kalshi's recommended type) sign the text directly", () => {
+  const ed = crypto.generateKeyPairSync("ed25519");
+  const edPem = ed.privateKey.export({ type: "pkcs8", format: "pem" });
+  const sig = signKalshi({ privateKeyPem: edPem, timestampMs: "1700000000000", method: "GET", path: "/trade-api/v2/portfolio/balance?x=1" });
+  assert.ok(crypto.verify(null, Buffer.from("1700000000000GET/trade-api/v2/portfolio/balance"), ed.publicKey, Buffer.from(sig, "base64")));
+  assert.equal(Buffer.from(sig, "base64").length, 64);
+  // An RSA key in PKCS#8 form (same "BEGIN PRIVATE KEY" header) still signs with RSA-PSS.
+  const rsa8 = privateKey.export({ type: "pkcs8", format: "pem" });
+  assert.ok(verify("1GET/p", signKalshi({ privateKeyPem: rsa8, timestampMs: "1", method: "GET", path: "/p" })));
+});

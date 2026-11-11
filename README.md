@@ -112,7 +112,7 @@ per order on Kalshi). Stake = Kelly fraction × full Kelly, capped at the max-be
 | `POSTGRES_URL` | Storage (same as the Saratoga desk). Without it the desk falls back to browser storage. |
 | `ANTHROPIC_API_KEY` | Find transcripts + Ask Claude. |
 | `DASHBOARD_TOKEN` | Any long random string. **Required** for portfolio sync; when set it also gates Claude and transcript fetching. Enter the same value under Settings → Dashboard token. |
-| `KALSHI_API_KEY_ID`, `KALSHI_PRIVATE_KEY` | Portfolio sync. Create an API key in Kalshi (Account → API keys); paste the private key PEM as-is (escaped `\n` also works). The desk only issues read requests. |
+| `KALSHI_API_KEY_ID`, `KALSHI_PRIVATE_KEY` | Portfolio sync. Create a key at kalshi.com/account/profile → API Keys → Create New API Key (Ed25519 or RSA both work); the private key is shown only once. Paste the whole PEM, BEGIN/END lines included (escaped `\n` also works). The desk only issues read requests. |
 | `KALSHI_API_BASE` | Optional, e.g. `https://demo-api.kalshi.co/trade-api/v2` for Kalshi's demo environment. |
 
 ## Testing
